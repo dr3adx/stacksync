@@ -1,4 +1,24 @@
-Hello and welcome to the remote python execution project!
+Hello and welcome to the python sandboxed script execution project!
+
+
 
 INSTRUCTIONS:
-1) Google Cloud Run URL: [FILL_HERE]
+
+1\) Run it localy: `docker build -t pythontest .; docker run -d -p 8080:8080 pythontest`
+
+2\) NSJail is not deployable on Google Cloud Run and I've tested several variations (see commits)
+
+3\) Example CURL: curl -X POST "http://127.0.0.1:8080/execute" \\
+
+&nbsp;    -H "Content-Type: application/json" \\
+
+&nbsp;    -d '{"script": "def main(): print(\\"Executing...\\"); return \\"WORKS\\""}'
+
+
+
+
+
+
+
+
+
