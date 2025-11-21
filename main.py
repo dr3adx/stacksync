@@ -12,7 +12,8 @@ MAX_SCRIPT_SIZE = 16 * 1024 # 16KB
 def execute_with_nsjail(script_content):
     MAIN_RETURN_PREFIX = "!MAIN_START!"
     MAIN_RETURN_SUFFIX = "!MAIN_END!"
-    
+
+    # Inject return-capturing boilerplate
     modified_script = f"""\
 {script_content}
 
@@ -35,72 +36,86 @@ except Exception as e:
     sys.exit(1)
 """
 
-    # temp file, pass it to nsjail
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.py') as tmp_script:
-        tmp_script.write(modified_script)
-        script_path = tmp_script.name
+    # Write script into /tmp where Cloud Run allows access
+    script_path = "/tmp/script.py"
+    with open(script_path, "w") as f:
+        f.write(modified_script)
 
-    try:
-        NSJAIL_CMD = [
-            'nsjail',
-            '--quiet',
-            '--chroot', '/',
-            '--user', 'nobody',
-            '--group', 'nogroup',
-            '--hostname', 'sandbox',
-            '--rlimit_as', str(1024 * 1024 * 1024),   
-            '--rlimit_cpu', '60',                   
-            '--rlimit_fsize', '1024',                 
-            '--rlimit_nofile', '64',                  
-            '--tmpfs', '/tmp:size=25000000',        
-            '--seccomp_string', 'KILL { execveat } KILL { fork }  KILL { vfork } KILL { ptrace } KILL { mount } KILL { kexec_file_load } KILL { kexec_load } KILL { chroot } KILL { setns } DEFAULT ALLOW',
-            # mount only necessary files
-            '-R', '/usr/bin/python3',
-            '-R', '/usr/lib/python3/dist-packages', 
-            '-R', '/usr/local/lib/python3.11/dist-packages', 
-            '-R', f'{script_path}:/script.py',
+    NSJAIL_CMD = [
+        'nsjail',
+        '--quiet',
+        '--chroot', '/',             
+        '--user', 'nobody',
+        '--group', 'nogroup',
+        '--hostname', 'sandbox',
 
-            '--',
-            '/usr/local/bin/python3',
-            '/script.py'
-        ]
+        # limits
+        '--rlimit_as', str(1024 * 1024 * 1024),  # 1GB
+        '--rlimit_cpu', '60',
+        '--rlimit_fsize', '1024',
+        '--rlimit_nofile', '64',
 
-        result = subprocess.run(
-            NSJAIL_CMD,
-            capture_output=True,
-            text=True,
-            timeout=10, 
-            check=False
+        '--tmpfs', '/tmp:size=25000000',
+
+        '--disable_clone_newns',
+        '--disable_clone_newpid',
+        '--disable_clone_newuser',
+        '--disable_clone_newipc',
+        '--disable_clone_newnet',
+        '--disable_clone_newcgroup',
+        '--disable_clone_newuts',
+
+        '--seccomp_string',
+        'KILL { execveat } KILL { fork } KILL { vfork } KILL { ptrace } '
+        'KILL { mount } KILL { kexec_file_load } KILL { kexec_load } '
+        'KILL { chroot } KILL { setns } DEFAULT ALLOW',
+
+        '--',
+        '/usr/local/bin/python3',       # Python inside the container
+        script_path                     # script accessible inside jail
+    ]
+
+    # Run inside nsjail
+    result = subprocess.run(
+        NSJAIL_CMD,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False
+    )
+
+    stdout = result.stdout
+    stderr = result.stderr
+
+    # extract main() return JSON
+    match = re.search(
+        f'{re.escape(MAIN_RETURN_PREFIX)}(.*?){re.escape(MAIN_RETURN_SUFFIX)}',
+        stdout,
+        re.DOTALL
+    )
+
+    if match:
+        raw_return = match.group(1).strip()
+        stdout = re.sub(
+            f'{re.escape(MAIN_RETURN_PREFIX)}.*?{re.escape(MAIN_RETURN_SUFFIX)}\\n?',
+            '',
+            stdout,
+            flags=re.DOTALL
+        )
+        try:
+            main_return_json = json.loads(raw_return)
+        except json.JSONDecodeError:
+            raise ValueError("Script execution succeeded, but main() did not return valid JSON.")
+    else:
+        error_message = stderr if stderr else stdout
+        raise RuntimeError(
+            f"Script execution failed or main() did not return a value. Error: {error_message}"
         )
 
-        stdout = result.stdout
-        stderr = result.stderr
-        
-        match = re.search(f'{re.escape(MAIN_RETURN_PREFIX)}(.*?){re.escape(MAIN_RETURN_SUFFIX)}', stdout, re.DOTALL)
-        
-        main_return_json = None
-        
-        if match:
-            raw_return = match.group(1).strip()
-            stdout = re.sub(f'{re.escape(MAIN_RETURN_PREFIX)}.*?{re.escape(MAIN_RETURN_SUFFIX)}\\n?', '', stdout, flags=re.DOTALL)
-            
-            # validate
-            try:
-                main_return_json = json.loads(raw_return)
-            except json.JSONDecodeError:
-                raise ValueError("Script execution succeeded, but main() did not return valid JSON.")
-        else:
-            error_message = stderr if stderr else stdout
-            raise RuntimeError(f"Script execution failed or main() did not return a value. Error: {error_message}")
-
-        return {
-            "result": main_return_json,
-            "stdout": stdout + stderr
-        }
-
-    finally:
-        os.unlink(script_path)
-
+    return {
+        "result": main_return_json,
+        "stdout": stdout + stderr
+    }
 
 @app.route('/execute', methods=['POST'])
 def execute_script():
